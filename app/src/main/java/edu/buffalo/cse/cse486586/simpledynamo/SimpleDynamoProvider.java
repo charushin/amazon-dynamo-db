@@ -83,7 +83,7 @@ public class SimpleDynamoProvider extends ContentProvider {
 		//send to origin the cursor
 		String response = "";
 		try {
-			response = new ClientTask().executeOnExecutor(AsyncTask.THREAD_POOL_EXECUTOR, queryResponse.toString(), port).get();
+			response = new ClientTask().executeOnExecutor(AsyncTask.SERIAL_EXECUTOR, queryResponse.toString(), port).get();
 		} catch (InterruptedException e) {
 			e.printStackTrace();
 		} catch (ExecutionException e) {
@@ -524,7 +524,7 @@ public class SimpleDynamoProvider extends ContentProvider {
 						}
 
 					}
-					//client.close();
+					client.close();
 				} catch (Exception e){
 					e.printStackTrace();
 				}
