@@ -15,7 +15,7 @@ import android.database.sqlite.SQLiteOpenHelper;
      *
  * */
 public class DBHelper extends SQLiteOpenHelper {
-    private static final String DB_NAME="Simple_dynamo";
+    public static final String DB_NAME="Simple_dynamo";
     public static final String TABLE_NAME="message_tbl";
 
 

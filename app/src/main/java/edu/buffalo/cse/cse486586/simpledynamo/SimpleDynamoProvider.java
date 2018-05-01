@@ -1,6 +1,7 @@
 package edu.buffalo.cse.cse486586.simpledynamo;
 
 import java.io.BufferedReader;
+import java.io.File;
 import java.io.IOException;
 import java.io.InputStreamReader;
 import java.io.OutputStream;
@@ -9,6 +10,7 @@ import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.net.SocketException;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
@@ -21,6 +23,7 @@ import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ExecutionException;
 
 import android.content.ContentProvider;
+import android.content.ContentResolver;
 import android.content.ContentUris;
 import android.content.ContentValues;
 import android.content.Context;
@@ -37,6 +40,7 @@ public class SimpleDynamoProvider extends ContentProvider {
 
 	HashMap<String,Node> nodeHashMap = new HashMap<String, Node>();
 	static final String TAG = SimpleDynamoProvider.class.getSimpleName();
+
 
 	static final int SERVER_PORT = 10000;
 	public Uri mUri;
@@ -55,8 +59,9 @@ public class SimpleDynamoProvider extends ContentProvider {
 
 	@Override
 	public int delete(Uri uri, String selection, String[] selectionArgs) {
+		//sqlDB=dbHelper.getWritableDatabase();
 		// TODO Auto-generated method stub
-		sqlDB=dbHelper.getWritableDatabase();
+		//sqlDB=dbHelper.getWritableDatabase();
 		int deletedRows=0;
 		//check if only one avd - then all delete will be from here
 		 if(selection.equals("@")){
@@ -77,16 +82,56 @@ public class SimpleDynamoProvider extends ContentProvider {
 
 	@Override
 	public Uri insert(Uri uri, ContentValues values) {
+		Log.v("insert",values.get("key")+" and "+values.get("value"));
 
 		String port = checkWhereKeyBelongs(values.get("key").toString());
+		Log.e("insert","key: "+values.get("key")+" belongs to port: "+port);
 		Message queryResponse = new Message(myNode.getPort(), values.get("key").toString(), values.get("value").toString(), myNode.getPort(), "INSERT",null);
 		//send to origin the cursor
-		String response = "";
+		String response = "",response1 = "",response2="";
 		try {
-			response = new ClientTask().executeOnExecutor(AsyncTask.SERIAL_EXECUTOR, queryResponse.toString(), port).get();
-		} catch (InterruptedException e) {
-			e.printStackTrace();
-		} catch (ExecutionException e) {
+
+			if(nodeHashMap.get(port).isStatus()) {
+				response = new ClientTask().executeOnExecutor(AsyncTask.SERIAL_EXECUTOR, queryResponse.toString(), port).get();
+				Log.d(TAG, "INSERT: Response from node is: " + response);
+			}
+			else{
+				Log.d(TAG,"INSERT: Insertnot done on co-ordiantor. Status is failed");
+			}
+			//Adding failure handling part
+			//if Co-ordinator fails, send NODE_FAIL message to everyone
+			if(response.contains("FAIL")) {
+				Message nodeFail = new Message(myNode.getPort(), null, null, myNode.getPort(), "NODE_FAIL", port);
+				sendNodeFailToEveryone(nodeFail);
+			}
+			queryResponse.setType("REPLICA1");
+			Node succ1=nodeHashMap.get(nodeHashMap.get(port).getSucc_port1());
+			if(succ1.isStatus()) {
+				response1 = new ClientTask().executeOnExecutor(AsyncTask.SERIAL_EXECUTOR, queryResponse.toString(), nodeHashMap.get(port).getSucc_port1()).get();
+				Log.d(TAG, "INSERT: Response from 1st replica is: " + response1);
+			}
+			else{
+				Log.d(TAG,"INSERT: Insertnot done on REPLICA1. Status is failed");
+			}
+			if(response1.contains("FAIL")) {
+				Message nodeFail = new Message(myNode.getPort(), null, null, myNode.getPort(), "NODE_FAIL", nodeHashMap.get(port).getSucc_port1());
+				sendNodeFailToEveryone(nodeFail);
+			}
+			queryResponse.setType("REPLICA2");
+			Node succ2=nodeHashMap.get(nodeHashMap.get(port).getSucc_port2());
+			if(succ2.isStatus()) {
+				response2 = new ClientTask().executeOnExecutor(AsyncTask.SERIAL_EXECUTOR, queryResponse.toString(), nodeHashMap.get(port).getSucc_port2()).get();
+				Log.d(TAG, "INSERT: Response from 2nd replica is: " + response2);
+			}
+			else{
+				Log.d(TAG,"INSERT: Insertnot done on REPLICA2. Status is failed");
+			}
+			if(response2.contains("FAIL")) {
+				Message nodeFail = new Message(myNode.getPort(), null, null, myNode.getPort(), "NODE_FAIL", nodeHashMap.get(port).getSucc_port2());
+				sendNodeFailToEveryone(nodeFail);
+			}
+			//new ClientTask()., executeOnExecutor(AsyncTask.SERIAL_EXECUTOR, queryResponse.toString(), port);
+		}  catch(Exception e){
 			e.printStackTrace();
 		}
 		Log.d(TAG,"INSERT**:  Response is : "+response);
@@ -95,12 +140,39 @@ public class SimpleDynamoProvider extends ContentProvider {
 		return uri;
 	}
 
+	public void sendNodeFailToEveryone(Message message){
+		for (HashMap.Entry<String, Node> entry : nodeHashMap.entrySet()) {
+			String key = entry.getKey();
+			Node value = entry.getValue();
+			//send the node fail message on socket to everyone
+			Socket socket = new Socket();
+			try {
+				socket.connect(new InetSocketAddress(InetAddress.getByAddress(new byte[]{10, 0, 2, 2}),
+						Integer.parseInt(key)));
+				Log.d(TAG, "Client Side: "+socket.isConnected() + " and " + socket.getRemoteSocketAddress() + " and " + socket.getLocalSocketAddress());
+				//Fetching the output stream of the socket.
+				OutputStream os = socket.getOutputStream();
+				PrintWriter pw = new PrintWriter(os, true);
+				//Writing the message to be send to the other device on the socket's output stream.
+				Log.d(TAG,"Sending message to ServerSocket MSG: "+message);
+				Log.d(TAG,"Sending message to ServerSocket PORT: "+key);
+				pw.println(message.toString());
+				pw.flush();
+			} catch (IOException e) {
+				e.printStackTrace();
+			} catch(Exception e){
+				e.printStackTrace();
+			}
+		}
+	}
+
 	public String insertAndReplicate(Message message){
 		String response = "SUCCESS";
 		long id = 0;
 		ContentValues contentValues = new ContentValues();
 		contentValues.put("key",message.getKey());
 		contentValues.put("value",message.getValue());
+		//sqlDB=dbHelper.getWritableDatabase();
 		synchronized (readWriteLock){
 			while(!lockAvailable){
 				try {
@@ -111,21 +183,25 @@ public class SimpleDynamoProvider extends ContentProvider {
 				}
 			}
 			lockAvailable = true;
-			Log.d(TAG,"INSERT: Inserting in self");
-			try {
-				id = sqlDB.insertWithOnConflict(DBHelper.TABLE_NAME, null, contentValues, SQLiteDatabase.CONFLICT_REPLACE);
-			}
-			catch(Exception e){
-				e.printStackTrace();
-			}
-			if(message.getType().equals("INSERT")){
+			id = insert(contentValues);
+			/*if(message.getType().equals("INSERT")){
 				//send to replica1
 				message.setType("REPLICA1");
-				String replicateResponse = sendMessageToServerSocket(message,myNode.getSucc_port1());
-				Log.d(TAG,"INSERT AND REPLICATE: Response is "+replicateResponse);
+				String replicateResponse1="";
+				String replicateResponse2 = "";
+					*//*replicateResponse1 = new ClientTask().executeOnExecutor(AsyncTask.SERIAL_EXECUTOR,message.toString(),myNode.getSucc_port1()).get();*//*
+			//If using ClientTask, I am getting timeout. Why??????
+
+				 replicateResponse1 = sendMessageToServerSocket(message,myNode.getSucc_port1());
+				Log.d(TAG,"INSERT AND REPLICATE: Response is "+replicateResponse1);
+				*//*message.setType("REPLICA2");
+				 replicateResponse2 = sendMessageToServerSocket(message,myNode.getSucc_port2());
+				 //replicateResponse2 = new ClientTask().executeOnExecutor(AsyncTask.SERIAL_EXECUTOR,message.toString(),myNode.getSucc_port2()).get();
+				Log.d(TAG,"INSERT AND REPLICATE: Response is "+replicateResponse2);*//*
 				lockAvailable = true;
 				readWriteLock.notify();
-				return replicateResponse;
+				return replicateResponse1;
+
 			}
 			else if(message.getType().equals("REPLICA1")){
 				//send to replica2
@@ -135,7 +211,7 @@ public class SimpleDynamoProvider extends ContentProvider {
 				lockAvailable = true;
 				readWriteLock.notify();
 				return replicateResponse;
-			}
+			}*/
 
 
 			lockAvailable = true;
@@ -143,6 +219,19 @@ public class SimpleDynamoProvider extends ContentProvider {
 		}
 
 		return response;
+	}
+	public long insert(ContentValues contentValues){
+		sqlDB=dbHelper.getWritableDatabase();
+		Log.d(TAG,"INSERT: Inserting in self");
+		Log.d(TAG,"Inserting key: "+contentValues.get("key")+" and value: "+contentValues.get("value"));
+		long id = 0;
+		try {
+			id = sqlDB.insertWithOnConflict(DBHelper.TABLE_NAME, null, contentValues, SQLiteDatabase.CONFLICT_REPLACE);
+		}
+		catch(Exception e){
+			e.printStackTrace();
+		}
+		return id;
 	}
 
 	public String sendMessageToServerSocket(Message message, String portToSend){
@@ -161,8 +250,12 @@ public class SimpleDynamoProvider extends ContentProvider {
 			pw.println(message.toString());
 			pw.flush();
 			BufferedReader br = new BufferedReader(new InputStreamReader(socket.getInputStream()));
-			String msgReceived = br.readLine();
-			return msgReceived;
+			String msg="";
+			String msgReceived;
+			while((msgReceived=br.readLine())!=null){
+				msg =msg+msgReceived;
+			}
+			return msg;
 		} catch (IOException e) {
 			e.printStackTrace();
 		} catch(Exception e){
@@ -178,7 +271,12 @@ public class SimpleDynamoProvider extends ContentProvider {
 		//initializing all nodes
 		initializeNodes();
 		mUri = buildUri("content", "edu.buffalo.cse.cse486586.simpledht.provider");
+		File dynamoDB = this.getContext().getDatabasePath(DBHelper.DB_NAME);
+
+		boolean dbExists = dynamoDB.exists();
+		Log.d( TAG,"DB status: "+dynamoDB.exists());
 		dbHelper=new DBHelper(getContext());
+
 
 		// TelephonyManager tel = (TelephonyManager) this.getSystemService(Context.TELEPHONY_SERVICE);
 		TelephonyManager tel = (TelephonyManager)getContext().getSystemService(Context.TELEPHONY_SERVICE);
@@ -188,6 +286,18 @@ public class SimpleDynamoProvider extends ContentProvider {
 		Log.d(TAG,"OnCreate: My Port ID: "+myPort);
 		myNode=nodeHashMap.get(myPort);
 		Log.d(TAG,"OnCreate: My Node: "+myNode);
+		File dbFile2 = this.getContext().getDatabasePath(DBHelper.DB_NAME);
+		Log.d( TAG,"DB status: "+dbFile2.exists());
+
+		Log.d(TAG,"OnCreate: Initializing Database");
+		sqlDB=dbHelper.getWritableDatabase();
+		Log.d(TAG,"OnCreate: Initialized Database");
+
+		if(dbExists){
+			//send recovery message to everyone and receive response from everyone
+			Message recoveryMessage = new Message(myNode.getPort(),null,null,myNode.getPort(),"NODE_RECOVER",myNode.getPort());
+			sendRecoveryMessageToEveryone(recoveryMessage);
+		}
 
 		//starting server task
 		try {
@@ -197,11 +307,67 @@ public class SimpleDynamoProvider extends ContentProvider {
 		} catch (IOException e) {
 			Log.e(TAG, "Can't create a ServerSocket");
 		}
-		Log.d(TAG,"OnCreate: Initializing Database");
-		sqlDB=dbHelper.getWritableDatabase();
-		Log.d(TAG,"OnCreate: Initialized Database");
+
+
 
 		return true;
+	}
+
+	public void sendRecoveryMessageToEveryone(Message message){
+		synchronized (readWriteLock) {
+			while (!lockAvailable) {
+				try {
+					readWriteLock.wait();
+					Log.d(TAG, "INSERT AND REPLICATE: Waiting for lock to be available");
+				} catch (InterruptedException e) {
+					e.printStackTrace();
+				}
+			}
+			lockAvailable = true;
+			for (HashMap.Entry<String, Node> entry : nodeHashMap.entrySet()) {
+
+			String key = entry.getKey();
+			Node value = entry.getValue();
+			if (!myNode.getPort().equals(key)) {
+
+
+
+					try {
+						String response = new ClientTask().executeOnExecutor(AsyncTask.THREAD_POOL_EXECUTOR, message.toString(), key).get();
+
+						//receiving key value pairs and inserting in my content provider
+						String[] keyVal = response.split(",");
+						for (String s : keyVal) {
+							if (s.contains("-")) {
+								String k = s.split("-")[0];
+								String v = s.split("-")[1];
+								ContentValues cv = new ContentValues();
+								cv.put("key", k);
+								cv.put("value", v);
+								//insert(cv);
+								insert(cv);
+
+
+							}
+						}
+					} catch (InterruptedException e1) {
+						e1.printStackTrace();
+					} catch (ExecutionException e1) {
+						e1.printStackTrace();
+
+
+					} catch (Exception e) {
+						e.printStackTrace();
+					}
+
+				}
+
+			}
+			lockAvailable = true;
+			readWriteLock.notify();
+
+		}
+
 	}
 
 	private void initializeNodes() {
@@ -222,6 +388,10 @@ public class SimpleDynamoProvider extends ContentProvider {
 			String[] selectionArgs, String sortOrder) {
 		// TODO Auto-generated method stub
 		Log.v("query", selection);
+
+
+		String qport = checkWhereKeyBelongs(selection);
+		Log.e("query","key: "+selection+" belongs to port: "+qport);
 		MatrixCursor matrixCursor=new MatrixCursor(colNames);
 		//sqlDB=dbHelper.getWritableDatabase();
 
@@ -233,7 +403,15 @@ public class SimpleDynamoProvider extends ContentProvider {
 		if(selection.equals("@")){
 			cursor = sqLiteQueryBuilder.query(sqlDB, projection, null, null, null, null, sortOrder);
 			//Log.d(TAG, "QUERY: @ CURSOR IS: " + cursor.toString());
-			return cursor;
+			if (cursor != null) {
+				while (cursor.moveToNext()) {
+					Object[] columnValues = new Object[2];
+					columnValues[0] = cursor.getString(cursor.getColumnIndex("key"));
+					columnValues[1] = cursor.getString(cursor.getColumnIndex("value"));
+					matrixCursor.addRow(columnValues);
+				}
+			}
+			return matrixCursor;
 		}
 		else if(selection.equals("*")){
 			Log.d(TAG, "QUERY: QUERY ALL: I AM THE ORIGIN");
@@ -250,7 +428,14 @@ public class SimpleDynamoProvider extends ContentProvider {
 				}
 				Message queryForward = new Message(myNode.getPort(),"*:"+myNode.getPort(),null,myNode.getPort(),"QUERY",null);
 				//forward query all to successor
-				new ClientTask().executeOnExecutor(AsyncTask.SERIAL_EXECUTOR, queryForward.toString(), myNode.getSucc_port1());
+				//if my successor is available, send it, else send to my 2nd successor
+				if((nodeHashMap.get(myNode.getSucc_port1()).isStatus())) {
+					new ClientTask().executeOnExecutor(AsyncTask.SERIAL_EXECUTOR, queryForward.toString(), myNode.getSucc_port1());
+				}
+				else{
+					new ClientTask().executeOnExecutor(AsyncTask.SERIAL_EXECUTOR, queryForward.toString(), myNode.getSucc_port2());
+				}
+
 				while (syncList.isEmpty() || !receivedAll) {
 					try {
 						syncList.wait();
@@ -301,7 +486,12 @@ public class SimpleDynamoProvider extends ContentProvider {
 				new ClientTask().executeOnExecutor(AsyncTask.SERIAL_EXECUTOR, queryResponse.toString(), originPort);
 				Message queryForward = new Message(originPort,selection,null,myNode.getPort(),"QUERY",null);
 				//send to successor the request
-				new ClientTask().executeOnExecutor(AsyncTask.SERIAL_EXECUTOR, queryForward.toString(), myNode.getSucc_port1());
+				if((nodeHashMap.get(myNode.getSucc_port1()).isStatus())) {
+					new ClientTask().executeOnExecutor(AsyncTask.SERIAL_EXECUTOR, queryForward.toString(), myNode.getSucc_port1());
+				}
+				else{
+					new ClientTask().executeOnExecutor(AsyncTask.SERIAL_EXECUTOR, queryForward.toString(), myNode.getSucc_port2());
+				}
 			}
 		}
 
@@ -314,12 +504,38 @@ public class SimpleDynamoProvider extends ContentProvider {
 				//forward query all to successor
 				String response = "";
 				try {
-					response = new ClientTask().executeOnExecutor(AsyncTask.SERIAL_EXECUTOR, queryForward.toString(), nodeToSend.getSucc_port2()).get();
+					String succ2=nodeToSend.getSucc_port2();
+					String succ1=nodeToSend.getSucc_port1();
+					String node=nodeToSend.getPort();
+					if(nodeHashMap.get(succ2).isStatus()) {
+						response = new ClientTask().executeOnExecutor(AsyncTask.SERIAL_EXECUTOR, queryForward.toString(), nodeToSend.getSucc_port2()).get();
+					}
+					//if tail, fails send the tail failed message to everyone
+					if(response.contains("FAIL") || response.equals("") ) {
+						Message nodeFail = new Message(myNode.getPort(), null, null, myNode.getPort(), "NODE_FAIL", nodeHashMap.get(port).getSucc_port2());
+						sendNodeFailToEveryone(nodeFail);
+
+						//and get response from 1st successor
+						if(nodeHashMap.get(succ1).isStatus())
+							response = new ClientTask().executeOnExecutor(AsyncTask.SERIAL_EXECUTOR, queryForward.toString(), nodeToSend.getSucc_port1()).get();
+						if (response.contains("FAIL") || response.equals("") ) {
+							Message nodeFail2 = new Message(myNode.getPort(), null, null, myNode.getPort(), "NODE_FAIL", nodeHashMap.get(port).getSucc_port1());
+							sendNodeFailToEveryone(nodeFail2);
+
+							//if 1st successor fails, get it from co-ordinator
+						if(nodeHashMap.get(node).isStatus())
+							response = new ClientTask().executeOnExecutor(AsyncTask.SERIAL_EXECUTOR, queryForward.toString(), nodeToSend.getPort()).get();
+						}
+					}
 				} catch (InterruptedException e) {
 					e.printStackTrace();
 				} catch (ExecutionException e) {
 					e.printStackTrace();
 				}
+				catch (Exception e){
+					e.printStackTrace();
+				}
+				Log.v("query","Response is : "+response);
 				String [] pair=response.split("-");
 				matrixCursor.addRow(new String[]{pair[0],pair[1]});
 
@@ -329,6 +545,23 @@ public class SimpleDynamoProvider extends ContentProvider {
 		return cursor;
 	}
 
+	public String queryRequest(Message message){
+		Log.d(TAG,"QUERY: Query selection is : "+message.getKey());
+		Log.d(TAG,"QUERY: Sending Query Request to the tail of the chain");
+		message.setType("QUERY_TAIL");
+		//Message queryToTail = new Message(myNode.getPort(),selection,null,myNode.getPort(),"QUERY_KEY",null);
+		//forward query all to successor
+		String response = "";
+		try {
+			//response = new ClientTask().executeOnExecutor(AsyncTask.SERIAL_EXECUTOR, message.toString(), myNode.getSucc_port2()).get();
+			response = sendMessageToServerSocket(message,myNode.getSucc_port2());
+		} catch (Exception e) {
+			e.printStackTrace();
+		}
+		Log.d(TAG, "QUERY :Response is: " + response);
+		return response;
+	}
+
 	public String queryOnMyContentProvider(Message message){
 	Log.d(TAG, "QUERY: QUERY SELECTION IS: " + message.getKey());
 			Log.d(TAG,"QUERY: Lock is: "+lockAvailable);
@@ -336,6 +569,7 @@ public class SimpleDynamoProvider extends ContentProvider {
 		sqLiteQueryBuilder.setTables(DBHelper.TABLE_NAME);
 		String [] mSelectionArgs={message.getKey()};
 		Cursor cursor = null;
+		//sqlDB=dbHelper.getReadableDatabase();
 
 	synchronized (readWriteLock) {
 		while (!lockAvailable) {
@@ -476,11 +710,20 @@ public class SimpleDynamoProvider extends ContentProvider {
 						}
 						else if(msgType.equals("QUERY_KEY")){
 							Log.d(TAG,"ServerTask: QUERY_KEY");
+							//String response = queryRequest(msg);
 							String response = queryOnMyContentProvider(msg);
 							Log.d(TAG,"ServerTask:QUERY_KEY    response: "+response);
 							pw.println(response);
 							pw.flush();
-							Log.d(TAG,"QUERY_KEY: Written response on the socket");
+							Log.d(TAG,"QUERY_KEY: Written response on the socket"+msg.getOrigin());
+						}
+						else if(msgType.equals("QUERY_TAIL")){
+							Log.d(TAG,"ServerTask: QUERY_KEY");
+							String response = queryOnMyContentProvider(msg);
+							Log.d(TAG,"ServerTask:QUERY_KEY    response: "+response);
+							pw.println(response);
+							pw.flush();
+							Log.d(TAG,"QUERY_KEY: Written response on the socket"+msg.getOrigin());
 						}
 						else if(msgType.equals("QUERY_RESPONSE")){
 							String msgResponse=msgValues[2];
@@ -500,7 +743,7 @@ public class SimpleDynamoProvider extends ContentProvider {
 							Log.d(TAG,"ServerTask:QUERY_KEY    response: ");
 							pw.println("QUERY_RESPONSE ACK");
 							pw.flush();
-							Log.d(TAG,"QUERY_KEY: Written response on the socket");
+							Log.d(TAG,"QUERY_KEY: Written response on the socket"+msg.getOrigin());
 						}
 						else if(msgType.equals("INSERT") || msgType.equals("REPLICA1") || msgType.equals("REPLICA2")){
 							/*Log.d(TAG,"ServerTask:INSERT");
@@ -512,12 +755,32 @@ public class SimpleDynamoProvider extends ContentProvider {
 							Log.d(TAG,"ServerTask:INSERT    response: "+response);
 							pw.println(response);
 							pw.flush();
-							Log.d(TAG,"INSERT: Written response on the socket");
+							Log.d(TAG,"INSERT: Written response on the socket"+msg.getOrigin());
 						}
 
 						else if(msgType.equals("DELETE")){
 							Log.d(TAG,"ServerTask:DELETE");
 							int deletedRows=delete( mUri, msgValues[1],null);
+						} else if(msgType.equals("NODE_FAIL")){
+							Log.d(TAG,"ServerTask: NODE_FAIL "+msg.getResponse());
+							String response=msg.getResponse();
+							Node failedNode=nodeHashMap.get(response);
+							failedNode.status = false;
+							nodeHashMap.put(response,failedNode);
+						} else if(msgType.equals("NODE_RECOVER")){
+							Log.d(TAG,"ServerTask: NODE_RECOVER");
+							String response=msg.getResponse();
+							Node recoveredNode=nodeHashMap.get(response);
+							recoveredNode.status = true;
+							nodeHashMap.put(response,recoveredNode);
+
+							//sending data to the recoveredNode
+							String responseVal = sendDataToRecoveredNode(recoveredNode);
+							Log.d(TAG,"ServerTask:RECOVER    response: "+responseVal);
+							pw.println(responseVal);
+							pw.flush();
+							Log.d(TAG,"RECOVER: Written response on the socket"+msg.getOrigin());
+
 						}
 						else{
 							Log.d(TAG,"ServerTask:else");
@@ -533,6 +796,64 @@ public class SimpleDynamoProvider extends ContentProvider {
 		}  //end-doInBackground
 
 
+	}
+	public String sendDataToRecoveredNode(Node node){
+		String response ="";
+		//checking what data to send
+
+		if(node.getPort().equals(myNode.getSucc_port1()) || node.getPort().equals(myNode.getSucc_port2())){
+			//if node is my successor, send my data to the node
+			Log.d(TAG,"Sending my data to the recovered node");
+			Cursor qCursor = query(mUri, null, "@",null,null);
+			if(qCursor!=null){
+				while(qCursor.moveToNext()){
+					String key=qCursor.getString(qCursor.getColumnIndex("key"));
+					String value=qCursor.getString(qCursor.getColumnIndex("value"));
+					try {
+						/*if((genHash(key).compareTo(nodeHashMap.get(myNode.getPred_port()).getHash())>=0) && (genHash(key).compareTo(myNode.getHash())<0)){
+							response=response+key+"-"+value+",";
+						}*/
+						String port = checkWhereKeyBelongs(key);
+						if(port.equals(myNode.getPort())){
+							response=response+key+"-"+value+",";
+						}
+					} catch (Exception e) {
+						e.printStackTrace();
+					}
+				}
+			}
+		}
+		else if(node.getPort().equals(myNode.getPred_port())){
+			//if the node is my predecessor, send its own data to the node
+			Log.d(TAG,"Sending its own data to the recovered node");
+			Cursor qCursor = query(mUri, null, "@",null,null);
+			if(qCursor!=null){
+				while(qCursor.moveToNext()){
+					String key=qCursor.getString(qCursor.getColumnIndex("key"));
+					String value=qCursor.getString(qCursor.getColumnIndex("value"));
+					try {
+						/*if((genHash(key).compareTo(node.getHash())<=0) && (genHash(key).compareTo(nodeHashMap.get(node.getPred_port()).getHash())>0)){
+							//sending data whose key hash is less than pred and greater than 2nd pred
+							response=response+key+"-"+value+",";
+						}*/
+						String port = checkWhereKeyBelongs(key);
+						if(port.equals(node.getPort())){
+							response=response+key+"-"+value+",";
+						}
+					} catch (Exception e) {
+						e.printStackTrace();
+					}
+				}
+			}
+
+		}
+		else{
+			Log.d(TAG,"Node is not my predecesoor or 2 successor. Won't send anything");
+			response = "NO DATA";
+		}
+
+
+		return response;
 	}
 
 
@@ -565,13 +886,29 @@ public class SimpleDynamoProvider extends ContentProvider {
 				}
 				else {
 					BufferedReader br = new BufferedReader(new InputStreamReader(socket.getInputStream()));
-					String msgReceived = br.readLine();
-					return msgReceived;
+					String msg="";
+					String msgReceived;
+					while((msgReceived=br.readLine())!=null){
+					    Log.d(TAG,"Client Task, Message received from server is: "+msgReceived);
+						msg = msg+msgReceived;
+					}
+					if(!msg.equals("")){
+						return msg;
+					}
+					else{
+						return fail;
+					}
+
 				}
+			} catch(SocketException e){
+				Log.d(TAG,"Client Task: Socket Exception Received. When connecting to port: " +portToSend);
+				return fail;
 			} catch (IOException e) {
 				e.printStackTrace();
+				return fail;
 			} catch(Exception e){
 				e.printStackTrace();
+				return fail;
 			}
 			return fail;
 		}
